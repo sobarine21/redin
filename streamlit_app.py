@@ -3,152 +3,80 @@ import pandas as pd
 import io
 import requests
 
-# --- CONFIGURATION: Use Streamlit secrets ---
 SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-def fetch_user_tables():
+def auto_detect_tables():
     """
-    Fetch user tables in the public schema by requesting each table individually
-    via the REST API root endpoint, since system tables are not exposed.
+    Try to detect all tables from the REST API root endpoint.
     """
-    # We need to manually provide or fetch table names.
-    # Option 1: If you know your table names, list them here as a fallback:
-    # Example: return ["companies", "holdings", "transactions"]
-    # Option 2: Try to fetch from a known 'metadata' table or other means
-    # For now, scan the API root for available tables (public REST endpoints)
     url = f"{SUPABASE_URL}/rest/v1/"
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}"
     }
-    resp = requests.options(url, headers=headers)
-    resp.raise_for_status()
-    # The returned JSON will have available endpoints
-    table_list = []
-    if "Allow" in resp.headers:
-        # Not standard, but fallback for CORS preflight
-        return []
-    # Try to parse the table list from text/html (if PostgREST root)
     try:
-        # Response should be a JSON list of table endpoints, but sometimes is HTML
-        # PostgREST root returns a JSON array of available tables
-        table_list = resp.json()
-        table_list = [t for t in table_list if not t.startswith("rpc/")]
+        resp = requests.options(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        # Try to parse as JSON array (PostgREST root returns table list)
+        try:
+            tables = resp.json()
+            tables = [t for t in tables if not t.startswith("rpc/")]
+            return tables
+        except Exception:
+            return []
     except Exception:
-        pass
-    return table_list
+        return []
 
-def fetch_table_columns(table):
-    # Fetch just 1 row to get the column names
+def fetch_table_data(table):
+    """
+    Fetch ALL data from a given table.
+    """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}"
     }
-    params = {"select": "*", "limit": 1}
-    resp = requests.get(url, headers=headers, params=params)
+    params = {"select": "*"}
+    resp = requests.get(url, headers=headers, params=params, timeout=300)
     resp.raise_for_status()
-    data = resp.json()
-    if data:
-        return list(data[0].keys())
-    else:
-        # If table is empty, ask the user for columns
-        return []
+    rows = resp.json()
+    return pd.DataFrame(rows)
 
-def count_occurrences(table, column, values):
-    """
-    Count how many times each value appears in a given column of a table.
-    """
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Prefer": "count=exact"
-    }
-    total = 0
-    for value in values:
-        params = {f"{column}.ilike": value}
-        try:
-            resp = requests.get(url, headers=headers, params=params)
-            if resp.status_code == 200:
-                count = int(resp.headers.get("Content-Range", "0-0").split("/")[1])
-                total += count
-        except Exception:
-            continue
-    return total
+st.title("Supabase: Download All Tables as CSV (Read-Only, Automatic)")
 
-st.title("REDIN Enforcement Index Generator (Supabase Read-Only)")
-st.markdown("""
-- Upload a CSV file of index constituents (columns: 'Company Name', 'Ticker').
-- The app will search your Supabase DB for each constituent in all public tables/columns.
-- Download the REDIN Enforcement Index as CSV.
+tables = auto_detect_tables()
 
-**All database access is strictly read-only.**
-""")
-
-uploaded_file = st.file_uploader("Upload Index Constituent CSV", type=["csv"])
-
-# Show all tables and columns
-try:
-    tables = fetch_user_tables()
-    if not tables:
-        st.warning("No tables found via API root. Please enter your table names below, comma-separated.")
-        manual_tables = st.text_input("Enter table names:", "")
-        tables = [t.strip() for t in manual_tables.split(",") if t.strip()]
-    tables_columns = []
-    for t in tables:
-        cols = fetch_table_columns(t)
-        if not cols:
-            manual_cols = st.text_input(f"Enter columns for table `{t}` (comma-separated):", "")
-            cols = [c.strip() for c in manual_cols.split(",") if c.strip()]
-        tables_columns.append((t, cols))
-    st.subheader("Database Tables & Columns (public schema)")
-    for table, cols in tables_columns:
-        st.write(f"**{table}**: {', '.join(cols)}")
-except Exception as e:
-    st.error(f"Could not fetch table/column info: {e}")
+if not tables:
+    st.error("Could not auto-detect tables from Supabase. Please check your API permissions or add table names manually.")
     st.stop()
 
-if uploaded_file:
-    try:
-        df = pd.read_csv(uploaded_file)
-        if not {'Company Name', 'Ticker'}.issubset(df.columns):
-            st.error("CSV must have 'Company Name' and 'Ticker' columns.")
-            st.stop()
-        company_names = df['Company Name'].astype(str).tolist()
-        tickers = df['Ticker'].astype(str).tolist()
-        values = set([v.lower() for v in company_names + tickers])
+st.info(f"Detected {len(tables)} tables. Click the button below to download all as CSV (one file per table).")
 
-        # Search all tables/columns for occurrences
-        with st.spinner("Searching Supabase database..."):
-            result_data = []
-            for comp, ticker in zip(company_names, tickers):
-                total_count = 0
-                for table, columns in tables_columns:
-                    for col in columns:
-                        for val in (comp.lower(), ticker.lower()):
-                            count = count_occurrences(table, col, [val])
-                            total_count += count
-                result_data.append({
-                    "Company Name": comp,
-                    "Ticker": ticker,
-                    "REDIN Enforcement Index": float(total_count)
-                })
-            result_df = pd.DataFrame(result_data)
-            st.subheader("REDIN Enforcement Index")
-            st.dataframe(result_df)
+if st.button("Download ALL tables as ZIP of CSVs"):
+    import zipfile
+    from tempfile import NamedTemporaryFile
 
-            csv_buffer = io.StringIO()
-            result_df.to_csv(csv_buffer, index=False)
+    with NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
+        with zipfile.ZipFile(tmp_zip, "w") as zf:
+            for t in tables:
+                try:
+                    st.write(f"Downloading `{t}` ...")
+                    df = fetch_table_data(t)
+                    csv_bytes = df.to_csv(index=False).encode("utf-8")
+                    zf.writestr(f"{t}.csv", csv_bytes)
+                except Exception as e:
+                    st.warning(f"Failed to fetch {t}: {e}")
+        tmp_zip.flush()
+        tmp_zip.seek(0)
+        st.success("All tables downloaded. Click below to get the ZIP.")
+        with open(tmp_zip.name, "rb") as f:
             st.download_button(
-                label="Download Index CSV",
-                data=csv_buffer.getvalue(),
-                file_name="REDIN_Enforcement_Index.csv",
-                mime="text/csv"
+                label="Download ZIP of all tables",
+                data=f,
+                file_name="supabase_all_tables.zip",
+                mime="application/zip"
             )
-    except Exception as e:
-        st.error(f"Error processing file or querying Supabase: {e}")
 
 st.info("""
 **Database access is strictly read-only.**
