@@ -1,41 +1,26 @@
 import streamlit as st
 import pandas as pd
 import psycopg2
-import csv
 import io
-import os
-
-# --- CONFIGURATION ---
-
-# You should store your credentials securely, e.g. with Streamlit secrets or environment variables.
-st.secrets["supabase"] = {
-    "host": "YOUR_SUPABASE_HOST",
-    "port": "5432",
-    "database": "postgres",
-    "user": "YOUR_READONLY_USER",
-    "password": "YOUR_READONLY_PASSWORD"
-}
 
 # --- DATABASE CONNECTION (STRICTLY READ-ONLY) ---
 
 def get_db_connection():
-    # You MUST use a user with only SELECT permissions.
-    conn = psycopg2.connect(
+    # Use Streamlit secrets for Supabase/Postgres credentials
+    return psycopg2.connect(
         host=st.secrets["supabase"]["host"],
         port=st.secrets["supabase"]["port"],
         dbname=st.secrets["supabase"]["database"],
         user=st.secrets["supabase"]["user"],
         password=st.secrets["supabase"]["password"],
         sslmode="require",
-        options="-c default_transaction_read_only=on"  # Forces read-only at session level
+        options="-c default_transaction_read_only=on"  # Enforce read-only at session level
     )
-    return conn
 
 # --- GET ALL TABLES/COLUMNS (POSTGRESQL) ---
 
 def get_all_tables_and_columns(conn):
     cur = conn.cursor()
-    # Only list user tables in public schema (you can adapt schema if needed)
     cur.execute("""
         SELECT table_name, column_name
         FROM information_schema.columns
@@ -47,8 +32,6 @@ def get_all_tables_and_columns(conn):
         tables.setdefault(table_name, []).append(column_name)
     return list(tables.items())
 
-# --- SEARCH COMPANIES/TICKERS IN DB ---
-
 def search_company_in_db(conn, tables_columns, company_names, tickers):
     cur = conn.cursor()
     results = {}
@@ -56,20 +39,20 @@ def search_company_in_db(conn, tables_columns, company_names, tickers):
         total_count = 0
         for table, columns in tables_columns:
             for col in columns:
-                # Use safe parameterized queries, case-insensitive search
                 try:
-                    query = f'SELECT COUNT(*) FROM "{table}" WHERE LOWER(CAST("{col}" AS TEXT)) = %s OR LOWER(CAST("{col}" AS TEXT)) = %s'
+                    query = (
+                        f'SELECT COUNT(*) FROM "{table}" '
+                        f'WHERE LOWER(CAST("{col}" AS TEXT)) = %s OR LOWER(CAST("{col}" AS TEXT)) = %s'
+                    )
                     cur.execute(query, (comp.lower(), ticker.lower()))
                     count = cur.fetchone()[0]
                     total_count += count
                 except Exception:
-                    # Skip columns that can't be cast to text or searched
                     continue
         results[(comp, ticker)] = total_count
     return results
 
 def compute_redin_index(count):
-    # For now score = count (weighted average = count)
     return float(count)
 
 # --- STREAMLIT APP ---
@@ -81,10 +64,8 @@ st.markdown("""
 - Download the REDIN Enforcement Index as CSV.
 """)
 
-# Upload CSV
 uploaded_file = st.file_uploader("Upload Index Constituent CSV", type=["csv"])
 
-# DB connection (read-only)
 try:
     conn = get_db_connection()
 except Exception as e:
@@ -93,7 +74,6 @@ except Exception as e:
 
 guardrails_error = False
 
-# Display tables and columns (for user info)
 try:
     tables_columns = get_all_tables_and_columns(conn)
     st.subheader("Database Tables & Columns (public schema)")
@@ -103,22 +83,18 @@ except Exception as e:
     st.error(f"Failed to fetch tables/columns: {e}")
     guardrails_error = True
 
-# Process upload
 if uploaded_file and not guardrails_error:
     try:
         df = pd.read_csv(uploaded_file)
-        # Basic validation
         if not {'Company Name', 'Ticker'}.issubset(df.columns):
             st.error("CSV must have 'Company Name' and 'Ticker' columns.")
             st.stop()
         company_names = df['Company Name'].astype(str).tolist()
         tickers = df['Ticker'].astype(str).tolist()
 
-        # Search DB
         with st.spinner("Searching database..."):
             search_results = search_company_in_db(conn, tables_columns, company_names, tickers)
 
-        # Prepare results DataFrame
         result_data = []
         for (comp, ticker), count in search_results.items():
             index_score = compute_redin_index(count)
@@ -131,7 +107,6 @@ if uploaded_file and not guardrails_error:
         st.subheader("REDIN Enforcement Index")
         st.dataframe(result_df)
 
-        # Download option
         csv_buffer = io.StringIO()
         result_df.to_csv(csv_buffer, index=False)
         st.download_button(
@@ -143,8 +118,6 @@ if uploaded_file and not guardrails_error:
 
     except Exception as e:
         st.error(f"Error processing file: {e}")
-
-# --- EXTREME GUARDRAILS ---
 
 st.info("""
 **Database connection is strictly read-only.**
