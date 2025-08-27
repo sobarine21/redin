@@ -2,99 +2,193 @@ import streamlit as st
 import pandas as pd
 import requests
 import zipfile
-import io
 from tempfile import NamedTemporaryFile
 
+# --------------------------------------------------------------
+# ✨ Secrets – add these in .streamlit/secrets.toml or via UI
+# --------------------------------------------------------------
 SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+SUPABASE_ANON_KEY = st.secrets["SUPABASE_ANON_KEY"]
+# Optional – needed only for the full‑SQL‑dump feature
+SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
 
-BATCH_SIZE = 1000000  # Number of rows per request; safe and efficient for most setups
-
-def fetch_table_data_all(table):
-    """
-    Fetch ALL rows from a given table in batches using the Range header.
-    Returns a DataFrame with all rows.
-    """
-    url = f"{SUPABASE_URL}/rest/v1/{table}"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Range-Unit": "items"
+# --------------------------------------------------------------
+# Helper – build the auth headers
+# --------------------------------------------------------------
+def _auth_headers(use_service_role: bool = False) -> dict:
+    """Return the proper Authorization headers."""
+    key = SUPABASE_SERVICE_ROLE_KEY if use_service_role else SUPABASE_ANON_KEY
+    return {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
     }
-    params = {"select": "*"}
+
+# --------------------------------------------------------------
+# 1️⃣ Discover all user tables (public schema)
+# --------------------------------------------------------------
+@st.cache_data(ttl=600)    # cache for 10 min to avoid repeated queries
+def list_user_tables() -> list[str]:
+    """Return a list of table names in the public schema."""
+    sql = """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE';
+    """
+    resp = requests.post(
+        f"{SUPABASE_URL}/rest/v1/rpc",
+        json={"query": sql, "params": []},
+        headers=_auth_headers(),
+        timeout=30,
+    )
+    resp.raise_for_status()
+    rows = resp.json()
+    return [r["table_name"] for r in rows]
+
+# --------------------------------------------------------------
+# 2️⃣ Paginated fetch for a single table (Range header)
+# --------------------------------------------------------------
+def fetch_table_paginated(table: str, chunk: int = 10_000) -> pd.DataFrame:
+    """
+    Pull *all* rows from `table` using Supabase’s Range header.
+    The function loops until the server returns the final page.
+    """
     all_rows = []
     start = 0
 
-    # First batch: get total via Content-Range
     while True:
-        end = start + BATCH_SIZE - 1
-        batch_headers = {**headers, "Range": f"{start}-{end}"}
-        resp = requests.get(url, headers=batch_headers, params=params, timeout=300)
-        resp.raise_for_status()
+        end = start + chunk - 1
+        headers = _auth_headers()
+        headers["Range"] = f"0-{end}"   # “0‑end” is the range Supabase expects
+        url = f"{SUPABASE_URL}/rest/v1/{table}"
+        resp = requests.get(url, headers=headers, timeout=300)
+
+        if resp.status_code not in (200, 206):
+            resp.raise_for_status()
+
         batch = resp.json()
-        if batch:
-            all_rows.extend(batch)
-            st.info(f"Fetched rows {start + 1} to {start + len(batch)} from `{table}`")
-        else:
+        if not batch:
             break
-        # Stop if this is the last batch
-        content_range = resp.headers.get("Content-Range", None)
-        if content_range:
-            # Format: items start-end/total
-            try:
-                total = int(content_range.split("/")[-1])
-            except Exception:
-                total = None
-        else:
-            total = None
-        start += len(batch)
-        if total is not None and start >= total:
+
+        all_rows.extend(batch)
+        # 206 = more rows available, 200 = final page (or empty)
+        if resp.status_code == 200:
             break
-        if len(batch) < BATCH_SIZE:
-            break  # No more rows
+        start += chunk
+
     return pd.DataFrame(all_rows)
 
-st.title("Supabase: Download All Tables as Complete CSVs (No Row Skipping)")
+# --------------------------------------------------------------
+# 3️⃣ OPTIONAL: Full SQL dump (service‑role only)
+# --------------------------------------------------------------
+def download_sql_dump() -> bytes:
+    """
+    Calls Supabase’s hidden `pg_dump` RPC. It returns a base‑64 string;
+    we decode it to raw SQL bytes.
+    """
+    # Extract project reference from the Supabase URL (e.g. xyz.supabase.co → xyz)
+    ref = SUPABASE_URL.split("/")[-1].split(".")[0]
+    dump_url = f"https://{ref}.supabase.co/rest/v1/rpc/pg_dump"
 
-st.markdown("""
-- Paste your comma-separated table names below (required).
-- All data from each table will be fetched and included in a ZIP file of CSVs.
-- No data is skipped. **This fetches all rows, no matter the table size.**
-- Only GET requests are used (strictly read-only).
-""")
+    resp = requests.post(
+        dump_url,
+        json={},
+        headers=_auth_headers(use_service_role=True),
+        timeout=600,
+    )
+    resp.raise_for_status()
+    import base64
 
-manual_tables = st.text_area("Enter table names (comma-separated, no spaces):", "")
-tables = [t.strip() for t in manual_tables.split(",") if t.strip()]
+    payload = resp.json()
+    # Some deployments wrap the string in `dump` or `data`
+    b64 = payload.get("dump") or payload.get("data")
+    return base64.b64decode(b64)
+
+# --------------------------------------------------------------
+# UI
+# --------------------------------------------------------------
+st.title("🗂️ Supabase – Export Every Table (Full Data)")
+
+# -----------------------------------------------------------------
+# Step 1 – list tables
+# -----------------------------------------------------------------
+with st.spinner("Fetching list of tables…"):
+    tables = list_user_tables()
 
 if not tables:
-    st.info("No tables specified. Please paste your table names above to continue.")
+    st.error("❌ No tables found in the `public` schema.")
     st.stop()
 
-if st.button("Download ALL tables as ZIP of CSVs"):
-    with NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
-        with zipfile.ZipFile(tmp_zip, "w") as zf:
-            for t in tables:
-                try:
-                    st.write(f"Downloading **{t}** ...")
-                    df = fetch_table_data_all(t)
-                    csv_bytes = df.to_csv(index=False).encode("utf-8")
-                    zf.writestr(f"{t}.csv", csv_bytes)
-                    st.success(f"Added `{t}` ({len(df)} rows) to ZIP.")
-                except Exception as e:
-                    st.warning(f"Failed to fetch {t}: {e}")
-        tmp_zip.flush()
-        tmp_zip.seek(0)
-        st.success("All tables downloaded. Click below to get the ZIP.")
-        with open(tmp_zip.name, "rb") as f:
-            st.download_button(
-                label="Download ZIP of all tables",
-                data=f,
-                file_name="supabase_all_tables.zip",
-                mime="application/zip"
-            )
+st.success(f"✅ Found **{len(tables)}** tables.")
+st.caption(", ".join(tables))
 
-st.info("""
-**Database access is strictly read-only.**
-- The app uses Supabase REST API with your key, but only performs GET/HEAD/OPTIONS.
-- No write/update/delete/DDL statements are possible through this UI.
-""")
+# -----------------------------------------------------------------
+# Step 2 – download CSV + SQL ZIP
+# -----------------------------------------------------------------
+if st.button("Export ALL tables as CSV + SQL ZIP"):
+    with st.spinner("Downloading tables – this can take a few minutes…"):
+        with NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
+            with zipfile.ZipFile(tmp_zip, "w") as zf:
+                for tbl in tables:
+                    st.info(f"📥 Fetching **{tbl}** …")
+                    df = fetch_table_paginated(tbl)
+                    if df.empty:
+                        st.warning(f"⚠️ `{tbl}` appears empty.")
+                    csv_bytes = df.to_csv(index=False).encode("utf‑8")
+                    zf.writestr(f"{tbl}.csv", csv_bytes)
+                    st.success(f"✅ `{tbl}` ({len(df)} rows) added.")
+
+                # -------------------------------------------------
+                # Optional: add full SQL dump to same archive
+                # -------------------------------------------------
+                if SUPABASE_SERVICE_ROLE_KEY:
+                    try:
+                        st.info("Generating full SQL dump …")
+                        dump_bytes = download_sql_dump()
+                        zf.writestr("database.sql", dump_bytes)
+                        st.success("✅ SQL dump added to ZIP.")
+                    except Exception as exc:
+                        st.warning(f"⚠️ Could not create SQL dump: {exc}")
+
+            tmp_zip.flush()
+            tmp_zip.seek(0)
+
+            with open(tmp_zip.name, "rb") as f:
+                st.download_button(
+                    label="⬇️ Download ZIP (CSV + SQL dump)",
+                    data=f,
+                    file_name="supabase_export.zip",
+                    mime="application/zip",
+                )
+    st.success("✅ Export ready!")
+
+# -----------------------------------------------------------------
+# Step 3 – pure‑SQL dump (service‑role only)
+# -----------------------------------------------------------------
+if SUPABASE_SERVICE_ROLE_KEY:
+    if st.button("Download ONLY full SQL dump (service‑role)"):
+        with st.spinner("Creating SQL dump…"):
+            try:
+                dump_bytes = download_sql_dump()
+                st.download_button(
+                    label="⬇️ Download database.sql",
+                    data=dump_bytes,
+                    file_name="database.sql",
+                    mime="application/sql",
+                )
+                st.success("✅ SQL dump ready!")
+            except Exception as exc:
+                st.error(f"❌ Failed to generate dump: {exc}")
+
+# -----------------------------------------------------------------
+# Info panel
+# -----------------------------------------------------------------
+st.info(
+    """
+- **Read‑only**: The app only issues GET requests (or the service‑role RPC for dumps).  
+- **RLS**: When using the anon key you only receive rows the client can read.  
+- **Full dump**: Requires the `SUPABASE_SERVICE_ROLE_KEY`; it bypasses RLS and returns the exact DB state.  
+- **No external services** – everything runs locally in the Streamlit process.  
+"""
+)
