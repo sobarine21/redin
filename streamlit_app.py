@@ -8,7 +8,7 @@ from tempfile import NamedTemporaryFile
 SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-BATCH_SIZE = 10000  # Number of rows per request; safe and efficient for most setups
+BATCH_SIZE = 1000000  # Number of rows per request; safe and efficient for most setups
 
 def fetch_table_data_all(table):
     """
