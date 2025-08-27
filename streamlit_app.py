@@ -1,68 +1,85 @@
 import streamlit as st
 import pandas as pd
-import io
 import requests
 import zipfile
+import io
 from tempfile import NamedTemporaryFile
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-def fetch_table_data(table):
+BATCH_SIZE = 10000  # Number of rows per request; safe and efficient for most setups
+
+def fetch_table_data_all(table):
     """
-    Fetch ALL data from a given table.
+    Fetch ALL rows from a given table in batches using the Range header.
+    Returns a DataFrame with all rows.
     """
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     headers = {
         "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}"
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Range-Unit": "items"
     }
     params = {"select": "*"}
-    resp = requests.get(url, headers=headers, params=params, timeout=300)
-    resp.raise_for_status()
-    rows = resp.json()
-    return pd.DataFrame(rows)
+    all_rows = []
+    start = 0
 
-st.title("Supabase: Download All Tables as CSV (Read-Only, Automatic or Manual)")
+    # First batch: get total via Content-Range
+    while True:
+        end = start + BATCH_SIZE - 1
+        batch_headers = {**headers, "Range": f"{start}-{end}"}
+        resp = requests.get(url, headers=batch_headers, params=params, timeout=300)
+        resp.raise_for_status()
+        batch = resp.json()
+        if batch:
+            all_rows.extend(batch)
+            st.info(f"Fetched rows {start + 1} to {start + len(batch)} from `{table}`")
+        else:
+            break
+        # Stop if this is the last batch
+        content_range = resp.headers.get("Content-Range", None)
+        if content_range:
+            # Format: items start-end/total
+            try:
+                total = int(content_range.split("/")[-1])
+            except Exception:
+                total = None
+        else:
+            total = None
+        start += len(batch)
+        if total is not None and start >= total:
+            break
+        if len(batch) < BATCH_SIZE:
+            break  # No more rows
+    return pd.DataFrame(all_rows)
 
-# Try to auto-detect tables (most likely won't work, so fallback to manual)
-tables = []
-try:
-    url = f"{SUPABASE_URL}/rest/v1/"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}"
-    }
-    resp = requests.options(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    try:
-        tables = resp.json()
-        tables = [t for t in tables if not t.startswith("rpc/")]
-    except Exception:
-        tables = []
-except Exception:
-    tables = []
+st.title("Supabase: Download All Tables as Complete CSVs (No Row Skipping)")
 
-if not tables:
-    st.warning("Could not auto-detect tables from Supabase. Please paste your table names below (comma-separated, no spaces):")
-    manual_tables = st.text_area("Enter table names (comma-separated):", "")
-    tables = [t.strip() for t in manual_tables.split(",") if t.strip()]
+st.markdown("""
+- Paste your comma-separated table names below (required).
+- All data from each table will be fetched and included in a ZIP file of CSVs.
+- No data is skipped. **This fetches all rows, no matter the table size.**
+- Only GET requests are used (strictly read-only).
+""")
+
+manual_tables = st.text_area("Enter table names (comma-separated, no spaces):", "")
+tables = [t.strip() for t in manual_tables.split(",") if t.strip()]
 
 if not tables:
     st.info("No tables specified. Please paste your table names above to continue.")
     st.stop()
-
-st.info(f"{len(tables)} tables will be downloaded. Click below to download all as CSV (one file per table, zipped).")
 
 if st.button("Download ALL tables as ZIP of CSVs"):
     with NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
         with zipfile.ZipFile(tmp_zip, "w") as zf:
             for t in tables:
                 try:
-                    st.write(f"Downloading `{t}` ...")
-                    df = fetch_table_data(t)
+                    st.write(f"Downloading **{t}** ...")
+                    df = fetch_table_data_all(t)
                     csv_bytes = df.to_csv(index=False).encode("utf-8")
                     zf.writestr(f"{t}.csv", csv_bytes)
+                    st.success(f"Added `{t}` ({len(df)} rows) to ZIP.")
                 except Exception as e:
                     st.warning(f"Failed to fetch {t}: {e}")
         tmp_zip.flush()
