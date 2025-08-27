@@ -2,31 +2,11 @@ import streamlit as st
 import pandas as pd
 import io
 import requests
+import zipfile
+from tempfile import NamedTemporaryFile
 
 SUPABASE_URL = st.secrets["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-
-def auto_detect_tables():
-    """
-    Try to detect all tables from the REST API root endpoint.
-    """
-    url = f"{SUPABASE_URL}/rest/v1/"
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}"
-    }
-    try:
-        resp = requests.options(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        # Try to parse as JSON array (PostgREST root returns table list)
-        try:
-            tables = resp.json()
-            tables = [t for t in tables if not t.startswith("rpc/")]
-            return tables
-        except Exception:
-            return []
-    except Exception:
-        return []
 
 def fetch_table_data(table):
     """
@@ -43,20 +23,38 @@ def fetch_table_data(table):
     rows = resp.json()
     return pd.DataFrame(rows)
 
-st.title("Supabase: Download All Tables as CSV (Read-Only, Automatic)")
+st.title("Supabase: Download All Tables as CSV (Read-Only, Automatic or Manual)")
 
-tables = auto_detect_tables()
+# Try to auto-detect tables (most likely won't work, so fallback to manual)
+tables = []
+try:
+    url = f"{SUPABASE_URL}/rest/v1/"
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}"
+    }
+    resp = requests.options(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    try:
+        tables = resp.json()
+        tables = [t for t in tables if not t.startswith("rpc/")]
+    except Exception:
+        tables = []
+except Exception:
+    tables = []
 
 if not tables:
-    st.error("Could not auto-detect tables from Supabase. Please check your API permissions or add table names manually.")
+    st.warning("Could not auto-detect tables from Supabase. Please paste your table names below (comma-separated, no spaces):")
+    manual_tables = st.text_area("Enter table names (comma-separated):", "")
+    tables = [t.strip() for t in manual_tables.split(",") if t.strip()]
+
+if not tables:
+    st.info("No tables specified. Please paste your table names above to continue.")
     st.stop()
 
-st.info(f"Detected {len(tables)} tables. Click the button below to download all as CSV (one file per table).")
+st.info(f"{len(tables)} tables will be downloaded. Click below to download all as CSV (one file per table, zipped).")
 
 if st.button("Download ALL tables as ZIP of CSVs"):
-    import zipfile
-    from tempfile import NamedTemporaryFile
-
     with NamedTemporaryFile(delete=False, suffix=".zip") as tmp_zip:
         with zipfile.ZipFile(tmp_zip, "w") as zf:
             for t in tables:
