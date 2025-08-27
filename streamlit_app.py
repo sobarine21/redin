@@ -60,7 +60,7 @@ def fetch_table_paginated(table: str, chunk: int = 10_000) -> pd.DataFrame:
     while True:
         end = start + chunk - 1
         headers = _auth_headers()
-        headers["Range"] = f"0-{end}"   # “0‑end” is the range Supabase expects
+        headers["Range"] = f"{start}-{end}"   # proper Range header
         url = f"{SUPABASE_URL}/rest/v1/{table}"
         resp = requests.get(url, headers=headers, timeout=300)
 
@@ -135,7 +135,7 @@ if st.button("Export ALL tables as CSV + SQL ZIP"):
                     df = fetch_table_paginated(tbl)
                     if df.empty:
                         st.warning(f"⚠️ `{tbl}` appears empty.")
-                    csv_bytes = df.to_csv(index=False).encode("utf‑8")
+                    csv_bytes = df.to_csv(index=False).encode("utf-8")
                     zf.writestr(f"{tbl}.csv", csv_bytes)
                     st.success(f"✅ `{tbl}` ({len(df)} rows) added.")
 
